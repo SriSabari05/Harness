@@ -8,9 +8,46 @@
 # responds with real nutrition data.
 # ──────────────────────────────────────────────────────────────
 
+import json
+from pathlib import Path
 import streamlit as st
 from agent import run_agent
 from food_database import list_all_foods
+
+# ─── Storage Persistence ─────────────────────────────────────
+# We persist chat history to a local JSON file so that refreshing
+# or reopening the browser tab retains the entire conversation.
+HISTORY_FILE = Path(__file__).parent / "chat_history.json"
+
+
+def load_saved_history() -> list:
+    """Load conversation history from local disk if it exists."""
+    if HISTORY_FILE.exists():
+        try:
+            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return []
+    return []
+
+
+def save_history(history: list) -> None:
+    """Persist conversation history to disk."""
+    try:
+        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(history, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"Warning: Failed to save history: {e}")
+
+
+def clear_saved_history() -> None:
+    """Clear in-memory and disk-persisted history."""
+    if HISTORY_FILE.exists():
+        try:
+            HISTORY_FILE.unlink()
+        except Exception:
+            pass
+
 
 # ─── Page Config (must be first Streamlit call) ──────────────
 
@@ -21,11 +58,10 @@ st.set_page_config(
 )
 
 # ─── Session State ───────────────────────────────────────────
-# Streamlit re-runs this entire file on every interaction.
-# session_state is how we keep data between re-runs.
+# Initialize from disk so conversations survive browser refreshes.
 
 if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
+    st.session_state.chat_history = load_saved_history()
 
 # ─── Sidebar ─────────────────────────────────────────────────
 
@@ -67,6 +103,7 @@ with st.sidebar:
 
     if st.button("🗑️ Clear Chat", use_container_width=True):
         st.session_state.chat_history = []
+        clear_saved_history()
         st.rerun()
 
 # ─── Main Chat Area ──────────────────────────────────────────
@@ -124,7 +161,7 @@ if user_input:
                 if result.get("tool_result"):
                     st.json(result["tool_result"])
 
-    # 3. Save assistant response
+    # 3. Save assistant response to state and disk
     st.session_state.chat_history.append({
         "role": "assistant",
         "content": result["response"],
@@ -135,6 +172,7 @@ if user_input:
             "tool_result": result.get("tool_result"),
         },
     })
+    save_history(st.session_state.chat_history)
 
 # ─── Footer ──────────────────────────────────────────────────
 
