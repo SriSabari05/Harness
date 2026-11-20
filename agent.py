@@ -58,30 +58,33 @@ RULES YOU MUST FOLLOW:
 # ─── Step 1: Detect Intent ──────────────────────────────────
 # We ask the LLM to classify what the user wants.
 
-INTENT_PROMPT = """Analyze the user's message and determine their intent.
+INTENT_PROMPT = """Analyze the user's latest message in light of the recent conversation history to determine their intent.
+
+Recent conversation:
+{history_text}
+
+User message: "{user_message}"
 
 Respond with ONLY a JSON object (no markdown, no explanation) in this format:
 {{
     "intent": "<one of: nutrition_question, food_lookup, meal_suggestion>",
-    "food_name": "<food item if mentioned, else null>",
-    "quantity_g": <quantity in grams if mentioned, else null>,
-    "ingredients": [<list of ingredients if mentioned, else empty list>],
+    "food_name": "<food item if mentioned or referenced from prior context, else null>",
+    "quantity_g": <quantity in grams if mentioned or referenced, else null>,
+    "ingredients": [<list of ingredients if mentioned or referenced, else empty list>],
     "reasoning": "<brief one-line reason for your classification>"
 }}
 
 INTENT DEFINITIONS:
-- "nutrition_question": General questions about nutrition, diet, health, food comparisons.
-  Examples: "Is rice good for weight loss?", "What are high-protein foods?", "What should I eat before gym?"
+- "nutrition_question": General questions about nutrition, diet, health, food comparisons, or follow-ups.
+  Examples: "Is rice good for weight loss?", "What about brown rice?", "Why is that?"
   
 - "food_lookup": User wants specific nutrition values for a food item.
-  Examples: "How many calories in 200g rice?", "Nutrition in 2 eggs", "Protein in chicken"
-  Note: If user says a count like "2 eggs", convert to grams (1 egg ≈ 50g, so 2 eggs = 100g).
-  Common conversions: 1 egg ≈ 50g, 1 banana ≈ 118g, 1 apple ≈ 182g, 1 slice bread ≈ 30g, 1 cup milk ≈ 244g, 1 cup rice ≈ 185g.
+  Examples: "How many calories in 200g rice?", "Nutrition in 2 eggs", "What about 300g of that?"
+  Note: Resolve pronouns and follow-ups from context (e.g., if previous conversation was about chicken, and user says "what about 200g of it?", food_name is "chicken").
+  Convert counts to grams (1 egg ≈ 50g, 1 banana ≈ 118g, 1 apple ≈ 182g, 1 slice bread ≈ 30g, 1 cup milk ≈ 244g, 1 cup rice ≈ 185g).
 
-- "meal_suggestion": User wants meal ideas, recipes, or what to cook with certain ingredients.
-  Examples: "I have eggs and rice, what can I make?", "Suggest a healthy breakfast", "What can I cook with chicken and potatoes?"
-
-User message: "{user_message}"
+- "meal_suggestion": User wants meal ideas, recipes, or what to cook with ingredients.
+  Examples: "I have eggs and rice, what can I make?", "Give me another idea with those ingredients", "Add tomatoes to that recipe"
 """
 
 
@@ -125,8 +128,14 @@ def run_agent(user_message: str, chat_history: list = None) -> dict:
     try:
         model_name = "gemini-3.5-flash-lite"
 
-        # ── Step 1: Detect intent ──
-        intent_query = INTENT_PROMPT.format(user_message=user_message)
+        # Format recent history for context
+        history_text = _format_history(chat_history)
+
+        # ── Step 1: Detect intent (context-aware) ──
+        intent_query = INTENT_PROMPT.format(
+            history_text=history_text if history_text else "None (first turn)",
+            user_message=user_message,
+        )
         intent_response = client.models.generate_content(
             model=model_name,
             contents=intent_query,
@@ -222,6 +231,19 @@ def _parse_intent(raw_text: str) -> dict:
         }
 
 
+def _format_history(chat_history: list | None, max_turns: int = 6) -> str:
+    """Format recent chat messages into a readable conversation transcript."""
+    if not chat_history:
+        return ""
+    recent = chat_history[-max_turns:]
+    lines = []
+    for msg in recent:
+        role = "User" if msg.get("role") == "user" else "Assistant"
+        content = msg.get("content", "").strip()
+        lines.append(f"{role}: {content}")
+    return "\n".join(lines)
+
+
 # ─── Helper: Generate Final Response ────────────────────────
 
 def _generate_response(
@@ -230,32 +252,27 @@ def _generate_response(
 ) -> str:
     """
     Use the LLM to generate the final user-facing response.
-
-    For food_lookup: We give the LLM the REAL data from our tool
-    and ask it to present it nicely (not to invent numbers).
-
-    For meal_suggestion: We give the LLM the ingredient data and
-    ask it to suggest a meal with a recipe.
-
-    For nutrition_question: We just let the LLM answer directly
-    with its knowledge (no specific numbers needed).
+    All modes include recent conversation history so follow-ups and
+    contextual questions are answered naturally.
     """
+    history_text = _format_history(chat_history)
+    history_block = f"Recent conversation:\n{history_text}\n\n" if history_text else ""
 
     if intent == "food_lookup" and tool_result:
         if "error" in tool_result:
             prompt = f"""{SYSTEM_PROMPT}
 
-The user asked: "{user_message}"
+{history_block}The user asked: "{user_message}"
 
 The food lookup tool returned an error: {tool_result['error']}
 Available foods in our database: {tool_result.get('available_foods', 'none')}
 
-Respond helpfully. Tell the user the food wasn't found, show them what's available,
-and offer to help with a different food. Keep it brief and friendly."""
+Respond helpfully taking into account any prior conversation context.
+Tell the user the food wasn't found, show what's available, and offer alternatives."""
         else:
             prompt = f"""{SYSTEM_PROMPT}
 
-The user asked: "{user_message}"
+{history_block}The user asked: "{user_message}"
 
 Here is the EXACT nutrition data from our database (DO NOT change these numbers):
 
@@ -268,10 +285,10 @@ Carbohydrates: {tool_result['carbs_g']}g
 Fat: {tool_result['fat_g']}g
 Fiber: {tool_result['fiber_g']}g
 
-Present this data to the user in a clear, friendly format.
+Present this data to the user clearly.
+If this was a follow-up or comparison to previous messages, acknowledge the context.
 Use the EXACT numbers above — do not round or change them.
-Add a brief helpful comment about the food's nutrition profile.
-Mention that values are based on standard reference data."""
+Add a brief helpful comment about the food's nutrition profile."""
 
     elif intent == "meal_suggestion" and tool_result:
         found = tool_result.get("found_ingredients", [])
@@ -285,14 +302,14 @@ Mention that values are based on standard reference data."""
 
         prompt = f"""{SYSTEM_PROMPT}
 
-The user asked: "{user_message}"
+{history_block}The user asked: "{user_message}"
 
 Ingredients found in our database (nutrition per 100g):
 {found_summary if found_summary else "None found"}
 
 Ingredients NOT in our database: {', '.join(missing) if missing else 'None'}
 
-Based on these ingredients, suggest ONE practical meal. Include:
+Based on these ingredients and any previous conversation preferences, suggest ONE practical meal. Include:
 1. Meal name
 2. Brief recipe (5 steps or fewer)
 3. Suggested quantity for each ingredient (in grams)
@@ -304,23 +321,14 @@ but note that nutrition for those items is estimated.
 Keep it practical and beginner-friendly."""
 
     else:
-        # General nutrition question — build with chat history for context
-        history_text = ""
-        if chat_history:
-            recent = chat_history[-6:]  # Last 3 exchanges
-            for msg in recent:
-                role = "User" if msg["role"] == "user" else "Assistant"
-                history_text += f"{role}: {msg['content']}\n"
-
+        # General nutrition question or conversational follow-up
         prompt = f"""{SYSTEM_PROMPT}
 
-{f"Recent conversation:\n{history_text}" if history_text else ""}
+{history_block}User: {user_message}
 
-User: {user_message}
-
-Answer the user's nutrition question. Be helpful, practical, and concise.
-If they ask about specific calorie/protein numbers for a food, suggest they
-use the food lookup feature for exact values.
+Answer the user's nutrition question naturally, keeping the ongoing conversation in mind.
+Be helpful, practical, and concise.
+If they ask about specific calorie/protein numbers for a food, suggest using the food lookup feature for exact values.
 Do not invent specific nutrition numbers."""
 
     response = client.models.generate_content(

@@ -95,6 +95,9 @@ for message in st.session_state.chat_history:
 user_input = st.chat_input("Ask me anything about nutrition...")
 
 if user_input:
+    # Capture history BEFORE adding the current message
+    current_history = list(st.session_state.chat_history)
+
     # 1. Show the user message
     st.session_state.chat_history.append({
         "role": "user",
@@ -103,10 +106,10 @@ if user_input:
     with st.chat_message("user"):
         st.markdown(user_input)
 
-    # 2. Run the agent
+    # 2. Run the agent with conversation history
     with st.chat_message("assistant"):
         with st.spinner("Thinking..."):
-            result = run_agent(user_input, st.session_state.chat_history)
+            result = run_agent(user_input, current_history)
 
         # Display the response
         st.markdown(result["response"])
